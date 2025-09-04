@@ -41,9 +41,9 @@ from locust import HttpUser, LoadTestShape, TaskSet, events, task, between
 # ---------------------------------------------------------------------------
 BASE_URL: str = os.getenv(
     "TARGET_HOST",
-    "http://172.20.207.198:8000/",
+    "http://ml-serving-order-acceptance.vroong-dev1.svc.cluster.local",
 )
-ENDPOINT_PATH: str = os.getenv("ENDPOINT_PATH", "/order_acceptance/predict_batch")
+ENDPOINT_PATH: str = os.getenv("ENDPOINT_PATH", "/order_acceptance/predict")
 SCENARIO: str = os.getenv("SCENARIO", "max")  # either "1" or "2"
 SIM_DURATION: int = int(os.getenv("SIM_DURATION", 30 * 60))  # seconds
 AVG_LATENCY_S: float = float(os.getenv("AVG_LATENCY", 0.66))  # sec, used to map RPS→users
@@ -102,7 +102,7 @@ def _random_driver_feature() -> Dict[str, Any]:
     }
 
 
-def _random_driver_features(min_drivers: int = 1, max_drivers: int = 20) -> List[Dict[str, Any]]:
+def _random_driver_features(min_drivers: int = 10, max_drivers: int = 100) -> List[Dict[str, Any]]:
     """Generate a list of random driver features."""
     num_drivers = random.randint(min_drivers, max_drivers)
     return [_random_driver_feature() for _ in range(num_drivers)]
@@ -144,19 +144,7 @@ def generate_payload() -> Dict[str, Any]:
         "order_id": str(uuid.uuid4()),
         "driver_features": _random_driver_features(),
         "order_features": _random_order_info(),
-        "variants": [
-            {"base_surge_amount": 0},
-            {"base_surge_amount": 100},
-            {"base_surge_amount": 200},
-            {"base_surge_amount": 300},
-            {"base_surge_amount": 400},
-            {"base_surge_amount": 500},
-            {"base_surge_amount": 600},
-            {"base_surge_amount": 700},
-            {"base_surge_amount": 800},
-            {"base_surge_amount": 900},
-            {"base_surge_amount": 1000},
-        ],
+    
     }
 
 
