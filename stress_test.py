@@ -34,26 +34,30 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
-from locust import HttpUser, LoadTestShape, TaskSet, events, task, between
+# Locust helpers
+from locust import HttpUser, LoadTestShape, TaskSet, events, task, constant
 
 # ---------------------------------------------------------------------------
 # Configuration via environment variables
 # ---------------------------------------------------------------------------
-BASE_URL: str = os.getenv(
-    "TARGET_HOST",
-    "http://ml-serving-order-acceptance.vroong-dev1.svc.cluster.local",
-)
+BASE_URL: str = os.getenv("TARGET_HOST", "http://localhost:9000")
+# Ensure scheme is present (Locust/requests require it). Allow plain host:port env vars.
+if not BASE_URL.startswith(("http://", "https://")):
+    BASE_URL = f"http://{BASE_URL}"
 ENDPOINT_PATH: str = os.getenv("ENDPOINT_PATH", "/order_acceptance/predict")
-SCENARIO: str = os.getenv("SCENARIO", "max")  # either "1" or "2"
+SCENARIO: str = os.getenv("SCENARIO", "2")  # either "1" or "2"
 SIM_DURATION: int = int(os.getenv("SIM_DURATION", 30 * 60))  # seconds
 AVG_LATENCY_S: float = float(os.getenv("AVG_LATENCY", 0.66))  # sec, used to map RPS→users
 OK_LATENCY_MS: int = int(os.getenv("OK_LATENCY_MS", 1000))  # max acceptable latency per request
 # New: configurable think time between tasks (helps reach high RPS when set to 0)
-WAIT_TIME_MIN_S: float = float(os.getenv("WAIT_TIME_MIN_S", 0.1))
-WAIT_TIME_MAX_S: float = float(os.getenv("WAIT_TIME_MAX_S", 0.3))
+# For pure throughput/RPS-oriented tests we minimise think-time.
+WAIT_TIME_MIN_S: float = float(os.getenv("WAIT_TIME_MIN_S", 0))
+WAIT_TIME_MAX_S: float = float(os.getenv("WAIT_TIME_MAX_S", 0))
 # New: safety factor to overprovision users to reliably hit target RPS
 OVERPROVISION_FACTOR: float = float(os.getenv("OVERPROVISION_FACTOR", 1.25))
 
+# Rolling estimate of observed latency (sec). Starts with configured default, then updates live.
+_OBS_LAT_S: float = AVG_LATENCY_S
 
 # ---------------------------------------------------------------------------
 # Logging Configuration
@@ -61,7 +65,7 @@ OVERPROVISION_FACTOR: float = float(os.getenv("OVERPROVISION_FACTOR", 1.25))
 @events.init.add_listener
 def setup_logging(environment, **kwargs):
     """Set up logging to a file with a timestamp (e.g., 'stress_test_240726.log')."""
-    log_dir = "deployment/scripts/logs"
+    log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
     log_filename = os.path.join(log_dir, f"stress_test_{datetime.now().strftime('%y%m%d')}.log")
     handler = logging.FileHandler(log_filename)
@@ -70,6 +74,18 @@ def setup_logging(environment, **kwargs):
     logging.getLogger().addHandler(handler)
     logging.getLogger().setLevel(logging.INFO)
     logging.info(f"Test run logs are being saved to {log_filename}")
+
+
+# ---------------------------------------------------------------------------
+# Metrics listeners – keep running average latency for adaptive user scaling
+# ---------------------------------------------------------------------------
+
+@events.request.add_listener  # type: ignore[call-arg]
+def _update_latency(request_type, name, response_time, response_length, **_kwargs):  # noqa: D401,D103
+    """Update exponential moving average of latency every time a request completes."""
+    global _OBS_LAT_S  # pylint: disable=global-statement
+    alpha = 0.1  # smoothing factor
+    _OBS_LAT_S = (1 - alpha) * _OBS_LAT_S + alpha * (response_time / 1000.0)
 
 
 def _random_coordinates() -> Dict[str, float]:
@@ -102,7 +118,7 @@ def _random_driver_feature() -> Dict[str, Any]:
     }
 
 
-def _random_driver_features(min_drivers: int = 10, max_drivers: int = 100) -> List[Dict[str, Any]]:
+def _random_driver_features(min_drivers: int = 50, max_drivers: int = 100) -> List[Dict[str, Any]]:
     """Generate a list of random driver features."""
     num_drivers = random.randint(min_drivers, max_drivers)
     return [_random_driver_feature() for _ in range(num_drivers)]
@@ -149,11 +165,13 @@ def generate_payload() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Locust user and tasks
+#   Locust user definition – zero think-time for constant arrival semantics
 # ---------------------------------------------------------------------------
+
+
 class OrderAcceptanceUser(HttpUser):
     host = BASE_URL
-    wait_time = between(WAIT_TIME_MIN_S, WAIT_TIME_MAX_S)  # configurable think time (default 0)
+    wait_time = constant(0)
 
     @task
     def rank_variants(self) -> None:
@@ -251,8 +269,8 @@ class DailyTrafficShape(LoadTestShape):
 
         Needed users U ≈ rps × (latency + avg_think_time) × overprovision_factor
         """
-        avg_think_time = (WAIT_TIME_MIN_S + WAIT_TIME_MAX_S) / 2.0
-        users = rps * (AVG_LATENCY_S + avg_think_time) * OVERPROVISION_FACTOR
+        # Use live latency estimate for more accurate concurrency sizing
+        users = rps * (_OBS_LAT_S) * OVERPROVISION_FACTOR
         return max(1, int(users))
 
     # ------------------------------------------------------------------
@@ -267,6 +285,6 @@ class DailyTrafficShape(LoadTestShape):
         rps = self._current_rps(t_day)
         user_count = self._rps_to_users(rps)
 
-        # Spawn rate: spawn all users within ~5 seconds for responsiveness
-        spawn_rate = max(1, user_count // 5)
+        # Spawn all required users quickly (<=1s) to keep up with target RPS
+        spawn_rate = max(1, user_count)
         return user_count, spawn_rate
